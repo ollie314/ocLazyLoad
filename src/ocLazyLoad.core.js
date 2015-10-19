@@ -4,7 +4,8 @@
     var regModules = ['ng', 'oc.lazyLoad'],
         regInvokes = {},
         regConfigs = [],
-        modulesToLoad = [],
+        modulesToLoad = [], // modules to load from angular.module or other sources
+        realModules = [], // real modules called from angular.module
         recordDeclarations = [],
         broadcast = angular.noop,
         runBlocks = {},
@@ -24,7 +25,8 @@
             },
             debug = false,
             events = false,
-            moduleCache = [];
+            moduleCache = [],
+            modulePromises = {};
 
         moduleCache.push = function(value) {
             if(this.indexOf(value) === -1) {
@@ -71,7 +73,7 @@
                     names[name] = true;
                     append(document.getElementById(name));
                     name = name.replace(':', '\\:');
-                    if(element[0].querySelectorAll) {
+                    if(typeof(element[0]) !== 'undefined' && element[0].querySelectorAll) {
                         angular.forEach(element[0].querySelectorAll(`.${ name }`), append);
                         angular.forEach(element[0].querySelectorAll(`.${ name }\\:`), append);
                         angular.forEach(element[0].querySelectorAll(`[${ name }]`), append);
@@ -126,18 +128,22 @@
          * @param obj
          */
         var stringify = function stringify(obj) {
-            var cache = [];
-            return JSON.stringify(obj, (key, value) => {
-                if(angular.isObject(value) && value !== null) {
-                    if(cache.indexOf(value) !== -1) {
-                        // Circular reference found, discard key
-                        return;
+            try {
+                return JSON.stringify(obj);
+            } catch (e) {
+                var cache = [];
+                return JSON.stringify(obj, (key, value) => {
+                    if(angular.isObject(value) && value !== null) {
+                        if(cache.indexOf(value) !== -1) {
+                            // Circular reference found, discard key
+                            return;
+                        }
+                        // Store value in our collection
+                        cache.push(value);
                     }
-                    // Store value in our collection
-                    cache.push(value);
-                }
-                return value;
-            });
+                    return value;
+                });
+            }
         };
 
         var hashCode = function hashCode(str) {
@@ -161,12 +167,13 @@
                     if(!angular.isString(moduleName)) {
                         moduleName = getModuleName(moduleName);
                     }
-                    if(!moduleName || justLoaded.indexOf(moduleName) !== -1) {
+                    if(!moduleName || justLoaded.indexOf(moduleName) !== -1 || (modules[moduleName] && realModules.indexOf(moduleName) === -1)) {
                         continue;
                     }
+                    // new if not registered
                     var newModule = regModules.indexOf(moduleName) === -1;
                     moduleFn = ngModuleFct(moduleName);
-                    if(newModule) { // new module
+                    if (newModule) {
                         regModules.push(moduleName);
                         _register(providers, moduleFn.requires, params);
                     }
@@ -204,16 +211,28 @@
             if(angular.isUndefined(regInvokes[moduleName][type])) {
                 regInvokes[moduleName][type] = {};
             }
-            var onInvoke = function(invokeName, signature) {
+            var onInvoke = function(invokeName, invoke) {
                 if(!regInvokes[moduleName][type].hasOwnProperty(invokeName)) {
                     regInvokes[moduleName][type][invokeName] = [];
                 }
-                if(regInvokes[moduleName][type][invokeName].indexOf(signature) === -1) {
+                if(checkHashes(invoke, regInvokes[moduleName][type][invokeName])) {
                     newInvoke = true;
-                    regInvokes[moduleName][type][invokeName].push(signature);
+                    regInvokes[moduleName][type][invokeName].push(invoke);
                     broadcast('ocLazyLoad.componentLoaded', [moduleName, type, invokeName]);
                 }
             };
+
+            function checkHashes(potentialNew, invokes) {
+                var isNew = true,
+                    newHash;
+                if (invokes.length) {
+                    newHash = signature(potentialNew);
+                    angular.forEach(invokes, invoke => {
+                        isNew = isNew && signature(invoke) !== newHash;
+                    });
+                }
+                return isNew;
+            }
 
             function signature(data) {
                 if(angular.isArray(data)) { // arrays are objects, we need to test for it first
@@ -230,13 +249,13 @@
             }
 
             if(angular.isString(invokeList)) {
-                onInvoke(invokeList, signature(args[2][1]));
+                onInvoke(invokeList, args[2][1]);
             } else if(angular.isObject(invokeList)) {
                 angular.forEach(invokeList, function(invoke, key) {
                     if(angular.isString(invoke)) { // decorators for example
-                        onInvoke(invoke, signature(invokeList[1]));
+                        onInvoke(invoke, invokeList[1]);
                     } else { // components registered as object lists {"componentName": function() {}}
-                        onInvoke(key, signature(invoke));
+                        onInvoke(key, invoke);
                     }
                 });
             } else {
@@ -504,6 +523,8 @@
                                 return;
                             }
                             requireEntry = config;
+                            // ignore the name because it's probably not a real module name
+                            config.name = undefined;
                         }
 
                         // Check if this dependency has been loaded previously
@@ -524,9 +545,21 @@
                             }
                             return;
                         } else if(angular.isArray(requireEntry)) {
-                            requireEntry = {
-                                files: requireEntry
-                            };
+                            var files = [];
+                            angular.forEach(requireEntry, entry => {
+                                // let's check if the entry is a file name or a config name
+                                var config = self.getModuleConfig(entry);
+                                if (config === null) {
+                                    files.push(entry);
+                                } else if(config.files) {
+                                    files = files.concat(config.files);
+                                }
+                            });
+                            if(files.length > 0) {
+                                requireEntry = {
+                                    files: files
+                                };
+                            }
                         } else if(angular.isObject(requireEntry)) {
                             if(requireEntry.hasOwnProperty('name') && requireEntry['name']) {
                                 // The dependency doesn't exist in the module cache and is a new configuration, so store and push it.
@@ -553,25 +586,27 @@
                  * Inject new modules into Angular
                  * @param moduleName
                  * @param localParams
+                 * @param real
                  */
-                inject: function(moduleName, localParams = {}) {
+                inject: function(moduleName, localParams = {}, real = false) {
                     var self = this,
                         deferred = $q.defer();
                     if(angular.isDefined(moduleName) && moduleName !== null) {
                         if(angular.isArray(moduleName)) {
                             var promisesList = [];
                             angular.forEach(moduleName, module => {
-                                promisesList.push(self.inject(module));
+                                promisesList.push(self.inject(moduleName, localParams, real));
                             });
                             return $q.all(promisesList);
                         } else {
-                            self._addToLoadList(self._getModuleName(moduleName), true);
+                            self._addToLoadList(self._getModuleName(moduleName), true, real);
                         }
                     }
                     if(modulesToLoad.length > 0) {
                         var res = modulesToLoad.slice(); // clean copy
                         var loadNext = function loadNext(moduleName) {
                             moduleCache.push(moduleName);
+                            modulePromises[moduleName] = deferred.promise;
                             self._loadDependencies(moduleName, localParams).then(function success() {
                                 try {
                                     justLoaded = [];
@@ -594,6 +629,8 @@
 
                         // load the first in list
                         loadNext(modulesToLoad.shift());
+                    } else if (localParams && localParams.name && modulePromises[localParams.name]) {
+                        return modulePromises[localParams.name];
                     } else {
                         deferred.resolve();
                     }
@@ -660,21 +697,29 @@
     angular.bootstrap = function(element, modules, config) {
         // we use slice to make a clean copy
         angular.forEach(modules.slice(), module => {
-            _addToLoadList(module, true);
+            _addToLoadList(module, true, true);
         });
         return bootstrapFct(element, modules, config);
     };
 
-    var _addToLoadList = function _addToLoadList(name, force) {
+    var _addToLoadList = function _addToLoadList(name, force, real) {
         if((recordDeclarations.length > 0 || force) && angular.isString(name) && modulesToLoad.indexOf(name) === -1) {
             modulesToLoad.push(name);
+            if(real) {
+                realModules.push(name);
+            }
         }
     };
 
     var ngModuleFct = angular.module;
     angular.module = function(name, requires, configFn) {
-        _addToLoadList(name);
+        _addToLoadList(name, false, true);
         return ngModuleFct(name, requires, configFn);
     };
+
+    // CommonJS package manager support:
+    if(typeof module !== 'undefined' && typeof exports !== 'undefined' && module.exports === exports) {
+        module.exports = 'oc.lazyLoad';
+    }
 
 })(angular, window);
