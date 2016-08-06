@@ -595,7 +595,7 @@
                         if(angular.isArray(moduleName)) {
                             var promisesList = [];
                             angular.forEach(moduleName, module => {
-                                promisesList.push(self.inject(moduleName, localParams, real));
+                                promisesList.push(self.inject(module, localParams, real));
                             });
                             return $q.all(promisesList);
                         } else {
@@ -685,7 +685,21 @@
                  * @param force
                  * @private
                  */
-                _addToLoadList: _addToLoadList
+                _addToLoadList: _addToLoadList,
+
+                /**
+                 * Unregister modules (you shouldn't have to use this)
+                 * @param modules
+                 */
+                _unregister: function(modules) {
+                    if(angular.isDefined(modules)) {
+                        if(angular.isArray(modules)) {
+                            angular.forEach(modules, module => {
+                                regInvokes[module] = undefined;
+                            });
+                        }
+                    }
+                }
             };
         };
 
